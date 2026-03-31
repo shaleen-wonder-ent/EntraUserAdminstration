@@ -226,7 +226,7 @@ Pass parameters directly for unattended or scheduled runs.
 
 After a successful run the output folder will look like this in VS Code (all files marked **U** — untracked, kept out of git by `.gitignore`):
 
-![Export output folder in VS Code](docs/output-screenshot.png)
+![Export output folder in VS Code](docs/sample_output_structure.png)
 
 The timestamped folder (`EntraExport_<yyyyMMdd_HHmmss>/`) contains:
 
