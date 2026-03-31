@@ -201,6 +201,9 @@ $Script:RequiredAzModules = @(
     'Az.Resources'
 )
 
+# Tenant ID collected interactively (when -TenantId param is not provided)
+$Script:InputTenantId = ''
+
 # All user properties requested in a single Graph call
 $Script:UserSelectProps = (
     'id,userPrincipalName,displayName,givenName,surname,mailNickname,' +
@@ -281,7 +284,16 @@ function Install-RequiredModules {
                 throw
             }
         }
-        Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop
+        # Az.Resources 7.x/8.x on Windows PowerShell 5.1 emits TypeInitializationException
+        # warnings from its AutoRest sub-modules during import; these are non-fatal and the
+        # module loads correctly. Redirect all streams to suppress the noise.
+        if ($mod -like 'Az.*') {
+            $null = Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop *>&1 |
+                    Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] -or
+                                   $_.FullyQualifiedErrorId -notmatch 'RegisterAzModule' }
+        } else {
+            Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop
+        }
         Write-Log "  $mod loaded." 'DEBUG'
     }
 }
@@ -302,11 +314,14 @@ function Connect-ToEntra {
             NoWelcome = $true
             ErrorAction = 'Stop'
         }
-        # If a tenant was supplied, scope the sign-in to that tenant so the
-        # browser never offers the personal MSA option.
-        if ($TenantId) {
-            $connectParams['TenantId'] = $TenantId
-            Write-Log "  Using supplied TenantId: $TenantId"
+        # Resolve tenant ID: CLI param takes precedence, then interactively collected value.
+        $resolvedTenantId = if ($TenantId) { $TenantId } else { $Script:InputTenantId }
+        if ($resolvedTenantId) {
+            $connectParams['TenantId'] = $resolvedTenantId
+            Write-Log "  Scoping sign-in to tenant: $resolvedTenantId"
+        } else {
+            Write-Log '  No TenantId supplied - the sign-in dialog will show all accounts.' 'WARN'
+            Write-Log '  If you accidentally pick a personal (@outlook.com/@hotmail.com) account the script will stop with a clear error.' 'WARN'
         }
 
         Connect-MgGraph @connectParams
@@ -417,6 +432,14 @@ function Show-OptionsMenu {
     Write-Host ('  ' + ('=' * 56)) -ForegroundColor Cyan
     Write-Host '  EXPORT OPTIONS' -ForegroundColor Cyan
     Write-Host ('  ' + ('=' * 56)) -ForegroundColor Cyan
+    Write-Host ''
+
+    # --- Tenant ID -------------------------------------------------------
+    Write-Host '  Tenant ID (recommended if you have personal MS accounts in your browser)' -ForegroundColor White
+    Write-Host '  Leave blank to use the default account picker.' -ForegroundColor DarkGray
+    Write-Host '  Find your Tenant ID at: https://entra.microsoft.com -> Overview -> Tenant ID' -ForegroundColor DarkGray
+    $tenantAns = Read-Host '  Tenant ID or domain [e.g. contoso.onmicrosoft.com, press Enter to skip]'
+    $Script:InputTenantId = $tenantAns.Trim()
     Write-Host ''
 
     $guestAns = Read-Host '  Include Guest users? [Y/N, default N]'
