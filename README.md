@@ -222,6 +222,29 @@ Pass parameters directly for unattended or scheduled runs.
 
 ---
 
+## Output Screenshot
+
+After a successful run the output folder will look like this in VS Code (all files marked **U** — untracked, kept out of git by `.gitignore`):
+
+![Export output folder in VS Code](docs/output-screenshot.png)
+
+The timestamped folder (`EntraExport_<yyyyMMdd_HHmmss>/`) contains:
+
+| File | Description |
+|---|---|
+| `users_profile.csv` | Flat user profile — one row per user |
+| `users_groups.csv` | Group memberships |
+| `users_directory_roles.csv` | Entra directory role assignments |
+| `users_app_assignments.csv` | Enterprise app role assignments |
+| `users_oauth2_grants.csv` | Delegated OAuth2 permission grants |
+| `users_auth_methods.csv` | MFA / authentication methods |
+| `users_licenses.csv` | License SKU assignments |
+| `users_devices.csv` | Registered / joined devices |
+| `export_summary.txt` | Run statistics and file manifest |
+| `export.log` | Detailed timestamped log |
+
+---
+
 ## Output Files
 
 All files are written to the output directory (default: `.\EntraExport_<yyyyMMdd_HHmmss>\`).

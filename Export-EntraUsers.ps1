@@ -249,7 +249,18 @@ function Write-Log {
         Write-Host $logLine -ForegroundColor $color
     }
     if ($Script:LogFile -and (Test-Path (Split-Path $Script:LogFile -Parent))) {
-        Add-Content -Path $Script:LogFile -Value $logLine -Encoding UTF8
+        try {
+            $fs = [System.IO.File]::Open(
+                $Script:LogFile,
+                [System.IO.FileMode]::Append,
+                [System.IO.FileAccess]::Write,
+                [System.IO.FileShare]::ReadWrite
+            )
+            $sw = [System.IO.StreamWriter]::new($fs, [System.Text.Encoding]::UTF8)
+            $sw.WriteLine($logLine)
+            $sw.Dispose()
+            $fs.Dispose()
+        } catch { <# silently skip log write if still locked #> }
     }
 }
 
@@ -374,8 +385,17 @@ function Connect-ToAzure {
         $null = Connect-AzAccount -Tenant $Script:TenantId -ErrorAction Stop
         Write-Log 'Azure RM connected.' 'SUCCESS'
     } catch {
-        Write-Log "Azure RM connection failed - Azure RBAC will be skipped. $($_.Exception.Message)" 'WARN'
-        $Script:IncludeAzureRBAC = $false
+        # InteractiveBrowserCredential can fail due to Azure.Identity assembly version
+        # conflicts when Microsoft.Graph is loaded in the same session. Fall back to
+        # device code flow which avoids that code path entirely.
+        try {
+            Write-Log 'Interactive browser auth failed, retrying with device code ...' 'WARN'
+            $null = Connect-AzAccount -Tenant $Script:TenantId -UseDeviceAuthentication -ErrorAction Stop
+            Write-Log 'Azure RM connected (device code).' 'SUCCESS'
+        } catch {
+            Write-Log "Azure RM connection failed - Azure RBAC will be skipped. $($_.Exception.Message)" 'WARN'
+            $Script:IncludeAzureRBAC = $false
+        }
     }
 }
 
@@ -442,16 +462,16 @@ function Show-OptionsMenu {
     $Script:InputTenantId = $tenantAns.Trim()
     Write-Host ''
 
-    $guestAns = Read-Host '  Include Guest users? [Y/N, default N]'
-    $Script:IncludeGuests = ($guestAns -match '^[Yy]')
+    $guestAns = Read-Host '  Include Guest users? [Y/n, default Y]'
+    $Script:IncludeGuests = (-not ($guestAns -match '^[Nn]'))
 
-    $rbacAns = Read-Host '  Include Azure Resource RBAC? (requires Az modules + separate sign-in) [Y/N, default N]'
-    $Script:IncludeAzureRBAC = ($rbacAns -match '^[Yy]')
+    $rbacAns = Read-Host '  Include Azure Resource RBAC? (requires Az modules + separate sign-in) [Y/n, default Y]'
+    $Script:IncludeAzureRBAC = (-not ($rbacAns -match '^[Nn]'))
 
-    $mfaAns = Read-Host '  Include MFA / auth methods? (UserAuthenticationMethod.Read.All) [Y/N, default Y]'
+    $mfaAns = Read-Host '  Include MFA / auth methods? (UserAuthenticationMethod.Read.All) [Y/n, default Y]'
     $Script:SkipAuthMethods = ($mfaAns -match '^[Nn]')
 
-    $devAns = Read-Host '  Include registered devices? [Y/N, default Y]'
+    $devAns = Read-Host '  Include registered devices? [Y/n, default Y]'
     $Script:SkipDevices = ($devAns -match '^[Nn]')
 
     Write-Host ''
@@ -486,9 +506,12 @@ function Get-UserIdsByScope {
     switch ($ScopeType) {
 
         'Tenant' {
-            $filter = "accountEnabled ne null$typeFilter"
-            $filter = $filter.TrimStart(' and ')
-            $users = Get-MgUser -All -Filter $filter -Property 'id' -ErrorAction Stop
+            if ($typeFilter) {
+                $filter = $typeFilter -replace '^\s*and\s+', ''
+                $users = Get-MgUser -All -Filter $filter -Property 'id' -ErrorAction Stop
+            } else {
+                $users = Get-MgUser -All -Property 'id' -ErrorAction Stop
+            }
             return @($users | Select-Object -ExpandProperty Id)
         }
 
@@ -506,14 +529,14 @@ function Get-UserIdsByScope {
 
             $members = Get-MgGroupTransitiveMember -GroupId $group.Id -All -ErrorAction Stop
             return @($members |
-                     Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } |
+                     Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.user' } |
                      Select-Object -ExpandProperty Id)
         }
 
         'Department' {
             $esc    = $ScopeVal -replace "'","''"
             $filter = "department eq '$esc'$typeFilter"
-            $filter = $filter.TrimStart(' and ')
+            $filter = $filter -replace '^\s*and\s+', ''
             $users  = Get-MgUser -All -Filter $filter -Property 'id' -ErrorAction Stop
             if (-not $users) { Write-Log "No users found in department: $ScopeVal" 'WARN' }
             return @($users | Select-Object -ExpandProperty Id)
@@ -533,7 +556,7 @@ function Get-UserIdsByScope {
 
             $members = Get-MgDirectoryAdministrativeUnitMember -AdministrativeUnitId $au.Id -All -ErrorAction Stop
             return @($members |
-                     Where-Object { $_.'@odata.type' -eq '#microsoft.graph.user' } |
+                     Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.user' } |
                      Select-Object -ExpandProperty Id)
         }
 
@@ -595,7 +618,7 @@ function Get-UserGroupMemberships {
 
         foreach ($m in $memberships) {
             $entry = $null
-            switch ($m.'@odata.type') {
+            switch ($m.AdditionalProperties['@odata.type']) {
 
                 '#microsoft.graph.group' {
                     try {
@@ -654,7 +677,7 @@ function Get-UserGroupMemberships {
                     $entry = @{
                         ObjectType = 'Other'
                         Id         = $m.Id
-                        OdataType  = $m.'@odata.type'
+                        OdataType  = $m.AdditionalProperties['@odata.type']
                     }
                 }
             }
@@ -697,7 +720,7 @@ function Get-UserDirectoryRoles {
     # Supplement via transitive membership (catches legacy role objects)
     try {
         $roleMembers = Get-MgUserTransitiveMemberOf -UserId $UserId -All -ErrorAction SilentlyContinue
-        foreach ($r in ($roleMembers | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.directoryRole' })) {
+        foreach ($r in ($roleMembers | Where-Object { $_.AdditionalProperties['@odata.type'] -eq '#microsoft.graph.directoryRole' })) {
             $roleDef = Get-MgDirectoryRole -DirectoryRoleId $r.Id -ErrorAction SilentlyContinue
             if ($roleDef) {
                 $alreadyHave = $result | Where-Object { $_.RoleDefinitionId -eq $roleDef.RoleTemplateId }
@@ -822,7 +845,7 @@ function Get-UserAuthMethods {
         $methods = Get-MgUserAuthenticationMethod -UserId $UserId -All -ErrorAction Stop
         return @($methods | ForEach-Object {
             $m = $_
-            switch ($m.'@odata.type') {
+            switch ($m.AdditionalProperties['@odata.type']) {
                 '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' {
                     @{
                         MethodType      = 'MicrosoftAuthenticator'
@@ -881,7 +904,7 @@ function Get-UserAuthMethods {
                 default {
                     @{
                         MethodType = 'Unknown'
-                        OdataType  = $m.'@odata.type'
+                        OdataType  = $m.AdditionalProperties['@odata.type']
                     }
                 }
             }
@@ -970,7 +993,7 @@ function Get-UserDevices {
                     Relationship = 'Owned'
                     ObjectId     = $item.Id
                     DisplayName  = $item.AdditionalProperties['displayName']
-                    OdataType    = $item.'@odata.type'
+                    OdataType    = $item.AdditionalProperties['@odata.type']
                 })
             }
         }
@@ -1035,25 +1058,25 @@ function Export-SingleUser {
         Write-Log "  [$Index/$Total] $upn" 'DEBUG'
 
         # 2 - Groups (transitive)
-        $groups      = Get-UserGroupMemberships    -UserId $UserId -UPN $upn
+        $groups      = @(Get-UserGroupMemberships    -UserId $UserId -UPN $upn)
 
         # 3 - Entra directory roles
-        $dirRoles    = Get-UserDirectoryRoles      -UserId $UserId -UPN $upn
+        $dirRoles    = @(Get-UserDirectoryRoles      -UserId $UserId -UPN $upn)
 
         # 4 - Azure Resource RBAC
-        $azureRbac   = Get-UserAzureRBAC           -UserId $UserId -UPN $upn
+        $azureRbac   = @(Get-UserAzureRBAC           -UserId $UserId -UPN $upn)
 
         # 5 - App role assignments + OAuth2 grants
         $apps        = Get-UserAppAssignments      -UserId $UserId -UPN $upn
 
         # 6 - MFA / auth methods
-        $authMethods = Get-UserAuthMethods         -UserId $UserId -UPN $upn
+        $authMethods = @(Get-UserAuthMethods         -UserId $UserId -UPN $upn)
 
         # 7 - Licenses
-        $licenses    = Get-UserLicenseDetails      -UserId $UserId -UPN $upn
+        $licenses    = @(Get-UserLicenseDetails      -UserId $UserId -UPN $upn)
 
         # 8 - Devices
-        $devices     = Get-UserDevices             -UserId $UserId -UPN $upn
+        $devices     = @(Get-UserDevices             -UserId $UserId -UPN $upn)
 
         # 9 - Manager + direct reports
         $orgInfo     = Get-UserManagerAndReports   -UserId $UserId -UPN $upn
@@ -1107,7 +1130,7 @@ function Export-SingleUser {
             LastPasswordChangeDateTime      = $u.LastPasswordChangeDateTime
             PasswordPolicies                = $u.PasswordPolicies
             SignInSessionsValidFromDateTime = $u.SignInSessionsValidFromDateTime
-            RefreshTokensValidFromDateTime  = $u.RefreshTokensValidFromDateTime
+            RefreshTokensValidFromDateTime  = $u.AdditionalProperties['refreshTokensValidFromDateTime']
             # --- On-premises sync ---
             OnPremisesSyncEnabled           = $u.OnPremisesSyncEnabled
             OnPremisesImmutableId           = $u.OnPremisesImmutableId
@@ -1127,8 +1150,8 @@ function Export-SingleUser {
             GroupMembershipCount            = $groups.Count
             DirectoryRoleCount              = $dirRoles.Count
             AzureRbacAssignmentCount        = $azureRbac.Count
-            AppRoleAssignmentCount          = $apps.AppRoleAssignments.Count
-            OAuth2GrantCount                = $apps.OAuth2Grants.Count
+            AppRoleAssignmentCount          = @($apps.AppRoleAssignments).Count
+            OAuth2GrantCount                = @($apps.OAuth2Grants).Count
             AuthMethodCount                 = $authMethods.Count
             LicenseCount                    = $licenses.Count
             DeviceCount                     = $devices.Count
@@ -1136,8 +1159,8 @@ function Export-SingleUser {
             _Groups                         = $groups
             _DirectoryRoles                 = $dirRoles
             _AzureRbac                      = $azureRbac
-            _AppRoleAssignments             = $apps.AppRoleAssignments
-            _OAuth2Grants                   = $apps.OAuth2Grants
+            _AppRoleAssignments             = @($apps.AppRoleAssignments)
+            _OAuth2Grants                   = @($apps.OAuth2Grants)
             _AuthMethods                    = $authMethods
             _Licenses                       = $licenses
             _Devices                        = $devices
@@ -1189,22 +1212,22 @@ function Write-CsvExports {
 
     # Group memberships
     $rows = foreach ($u in $Users) {
-        foreach ($g in $u._Groups) {
+        foreach ($g in ($u._Groups | Where-Object { $_['ObjectType'] -eq 'Group' })) {
             [PSCustomObject][ordered]@{
                 UserPrincipalName        = $u.UserPrincipalName
                 UserDisplayName          = $u.DisplayName
-                GroupId                  = $g.Id
-                GroupDisplayName         = $g.DisplayName
-                Category                 = $g.Category
-                SecurityEnabled          = $g.SecurityEnabled
-                MailEnabled              = $g.MailEnabled
-                IsDynamic                = $g.IsDynamic
-                MembershipRule           = $g.MembershipRule
-                OnPremisesSynced         = $g.OnPremisesSynced
-                OnPremisesNetBiosName    = $g.OnPremisesNetBiosName
-                OnPremisesDomainName     = $g.OnPremisesDomainName
-                OnPremisesSamAccountName = $g.OnPremisesSamAccountName
-                OnPremisesDN             = $g.OnPremisesDN
+                GroupId                  = $g['Id']
+                GroupDisplayName         = $g['DisplayName']
+                Category                 = $g['Category']
+                SecurityEnabled          = $g['SecurityEnabled']
+                MailEnabled              = $g['MailEnabled']
+                IsDynamic                = $g['IsDynamic']
+                MembershipRule           = $g['MembershipRule']
+                OnPremisesSynced         = $g['OnPremisesSynced']
+                OnPremisesNetBiosName    = $g['OnPremisesNetBiosName']
+                OnPremisesDomainName     = $g['OnPremisesDomainName']
+                OnPremisesSamAccountName = $g['OnPremisesSamAccountName']
+                OnPremisesDN             = $g['OnPremisesDN']
             }
         }
     }
@@ -1218,12 +1241,12 @@ function Write-CsvExports {
             [PSCustomObject][ordered]@{
                 UserPrincipalName = $u.UserPrincipalName
                 UserDisplayName   = $u.DisplayName
-                RoleDisplayName   = $r.RoleDisplayName
-                RoleDescription   = $r.RoleDescription
-                RoleDefinitionId  = $r.RoleDefinitionId
-                DirectoryScopeId  = $r.DirectoryScopeId
-                AssignmentType    = $r.AssignmentType
-                Source            = $r.Source
+                RoleDisplayName   = $r['RoleDisplayName']
+                RoleDescription   = $r['RoleDescription']
+                RoleDefinitionId  = $r['RoleDefinitionId']
+                DirectoryScopeId  = $r['DirectoryScopeId']
+                AssignmentType    = $r['AssignmentType']
+                Source            = $r['Source']
             }
         }
     }
@@ -1238,14 +1261,14 @@ function Write-CsvExports {
                 [PSCustomObject][ordered]@{
                     UserPrincipalName = $u.UserPrincipalName
                     UserDisplayName   = $u.DisplayName
-                    RoleName          = $r.RoleDefinitionName
-                    RoleDefinitionId  = $r.RoleDefinitionId
-                    Scope             = $r.Scope
-                    ResourceGroupName = $r.ResourceGroupName
-                    ResourceName      = $r.ResourceName
-                    ResourceType      = $r.ResourceType
-                    CanDelegate       = $r.CanDelegate
-                    AssignmentId      = $r.AssignmentId
+                    RoleName          = $r['RoleDefinitionName']
+                    RoleDefinitionId  = $r['RoleDefinitionId']
+                    Scope             = $r['Scope']
+                    ResourceGroupName = $r['ResourceGroupName']
+                    ResourceName      = $r['ResourceName']
+                    ResourceType      = $r['ResourceType']
+                    CanDelegate       = $r['CanDelegate']
+                    AssignmentId      = $r['AssignmentId']
                 }
             }
         }
@@ -1260,12 +1283,12 @@ function Write-CsvExports {
             [PSCustomObject][ordered]@{
                 UserPrincipalName  = $u.UserPrincipalName
                 UserDisplayName    = $u.DisplayName
-                ApplicationName    = $a.ApplicationName
-                ServicePrincipalId = $a.ServicePrincipalId
-                AppRoleName        = $a.AppRoleName
-                AppRoleId          = $a.AppRoleId
-                CreatedDateTime    = $a.CreatedDateTime
-                AssignmentId       = $a.AssignmentId
+                ApplicationName    = $a['ApplicationName']
+                ServicePrincipalId = $a['ServicePrincipalId']
+                AppRoleName        = $a['AppRoleName']
+                AppRoleId          = $a['AppRoleId']
+                CreatedDateTime    = $a['CreatedDateTime']
+                AssignmentId       = $a['AssignmentId']
             }
         }
     }
@@ -1279,11 +1302,11 @@ function Write-CsvExports {
             [PSCustomObject][ordered]@{
                 UserPrincipalName = $u.UserPrincipalName
                 UserDisplayName   = $u.DisplayName
-                ClientAppName     = $g.ClientAppName
-                ClientId          = $g.ClientId
-                ResourceId        = $g.ResourceId
-                Scope             = $g.Scope
-                ConsentType       = $g.ConsentType
+                ClientAppName     = $g['ClientAppName']
+                ClientId          = $g['ClientId']
+                ResourceId        = $g['ResourceId']
+                Scope             = $g['Scope']
+                ConsentType       = $g['ConsentType']
             }
         }
     }
@@ -1298,12 +1321,12 @@ function Write-CsvExports {
                 [PSCustomObject][ordered]@{
                     UserPrincipalName = $u.UserPrincipalName
                     UserDisplayName   = $u.DisplayName
-                    MethodType        = $m.MethodType
-                    PhoneNumber       = $m.PhoneNumber
-                    EmailAddress      = $m.EmailAddress
-                    DisplayName       = $m.DisplayName
-                    AaGuid            = $m.AaGuid
-                    CreatedDateTime   = $m.CreatedDateTime
+                    MethodType        = $m['MethodType']
+                    PhoneNumber       = $m['PhoneNumber']
+                    EmailAddress      = $m['EmailAddress']
+                    DisplayName       = $m['DisplayName']
+                    AaGuid            = $m['AaGuid']
+                    CreatedDateTime   = $m['CreatedDateTime']
                 }
             }
         }
@@ -1318,8 +1341,8 @@ function Write-CsvExports {
             [PSCustomObject][ordered]@{
                 UserPrincipalName = $u.UserPrincipalName
                 UserDisplayName   = $u.DisplayName
-                SkuPartNumber     = $l.SkuPartNumber
-                SkuId             = $l.SkuId
+                SkuPartNumber     = $l['SkuPartNumber']
+                SkuId             = $l['SkuId']
             }
         }
     }
@@ -1334,20 +1357,20 @@ function Write-CsvExports {
                 [PSCustomObject][ordered]@{
                     UserPrincipalName      = $u.UserPrincipalName
                     UserDisplayName        = $u.DisplayName
-                    Relationship           = $d.Relationship
-                    DeviceId               = $d.DeviceId
-                    DeviceDisplayName      = $d.DisplayName
-                    OperatingSystem        = $d.OperatingSystem
-                    OsVersion              = $d.OsVersion
-                    TrustType              = $d.TrustType
-                    IsCompliant            = $d.IsCompliant
-                    IsManaged              = $d.IsManaged
-                    ProfileType            = $d.ProfileType
-                    EnrollmentType         = $d.EnrollmentType
-                    ManagementType         = $d.ManagementType
-                    RegisteredDateTime     = $d.RegisteredDateTime
-                    ApproximateLastSignIn  = $d.ApproximateLastSignIn
-                    OnPremisesSynced       = $d.OnPremisesSynced
+                    Relationship           = $d['Relationship']
+                    DeviceId               = $d['DeviceId']
+                    DeviceDisplayName      = $d['DisplayName']
+                    OperatingSystem        = $d['OperatingSystem']
+                    OsVersion              = $d['OsVersion']
+                    TrustType              = $d['TrustType']
+                    IsCompliant            = $d['IsCompliant']
+                    IsManaged              = $d['IsManaged']
+                    ProfileType            = $d['ProfileType']
+                    EnrollmentType         = $d['EnrollmentType']
+                    ManagementType         = $d['ManagementType']
+                    RegisteredDateTime     = $d['RegisteredDateTime']
+                    ApproximateLastSignIn  = $d['ApproximateLastSignIn']
+                    OnPremisesSynced       = $d['OnPremisesSynced']
                 }
             }
         }
