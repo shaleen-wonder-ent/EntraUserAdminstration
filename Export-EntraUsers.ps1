@@ -117,6 +117,12 @@ param(
     [string]
     $ScopeValue,
 
+    # Your Entra ID tenant ID or primary domain, e.g. 'contoso.onmicrosoft.com' or
+    # the GUID from https://entra.microsoft.com -> Overview. Supplying this forces
+    # sign-in against your work/school tenant and avoids the MSA consumer error.
+    [string]
+    $TenantId,
+
     [ValidateSet('JSON','CSV','Both')]
     [string]
     $ExportFormat = 'Both',
@@ -284,11 +290,46 @@ function Install-RequiredModules {
 # CONNECTION
 # ---------------------------------------------------------------------------
 
+# The MSA consumer tenant ID — accounts that land here cannot use the
+# organisation / directory APIs that this script requires.
+$Script:MsaConsumerTenantId = '9188040d-6c67-4c5b-b112-36a304b66dad'
+
 function Connect-ToEntra {
     Write-Log 'Connecting to Microsoft Graph ...'
     try {
-        Connect-MgGraph -Scopes $Script:GraphScopes -NoWelcome -ErrorAction Stop
+        $connectParams = @{
+            Scopes    = $Script:GraphScopes
+            NoWelcome = $true
+            ErrorAction = 'Stop'
+        }
+        # If a tenant was supplied, scope the sign-in to that tenant so the
+        # browser never offers the personal MSA option.
+        if ($TenantId) {
+            $connectParams['TenantId'] = $TenantId
+            Write-Log "  Using supplied TenantId: $TenantId"
+        }
+
+        Connect-MgGraph @connectParams
         $ctx = Get-MgContext
+
+        # Detect MSA consumer sign-in before calling any tenant-only API.
+        # The consumer tenant GUID is a well-known constant for personal accounts.
+        if ($ctx.TenantId -eq $Script:MsaConsumerTenantId) {
+            Write-Host ''
+            Write-Host '  ERROR: You signed in with a personal Microsoft account (MSA).' -ForegroundColor Red
+            Write-Host '  This script requires a WORK or SCHOOL account that belongs to an Entra ID tenant.' -ForegroundColor Red
+            Write-Host ''
+            Write-Host '  How to fix:' -ForegroundColor Yellow
+            Write-Host '  1. Re-run the script and sign in with your organisation account (e.g. you@contoso.com).' -ForegroundColor Yellow
+            Write-Host '  2. Or supply your tenant ID explicitly to bypass the account picker:' -ForegroundColor Yellow
+            Write-Host '       .\Export-EntraUsers.ps1 -TenantId "contoso.onmicrosoft.com"' -ForegroundColor Cyan
+            Write-Host '       .\Export-EntraUsers.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"' -ForegroundColor Cyan
+            Write-Host '  (Your tenant ID is visible in Entra admin center -> Overview -> Tenant ID)' -ForegroundColor Yellow
+            Write-Host ''
+            Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+            throw 'MSA consumer account detected. A work/school account is required.'
+        }
+
         $org = (Get-MgOrganization -ErrorAction Stop) | Select-Object -First 1
 
         $Script:TenantId   = $ctx.TenantId
@@ -296,7 +337,17 @@ function Connect-ToEntra {
 
         Write-Log "Connected -> Tenant: $($Script:TenantName) [$($Script:TenantId)]" 'SUCCESS'
     } catch {
-        Write-Log "Graph connection failed: $($_.Exception.Message)" 'ERROR'
+        $msg = $_.Exception.Message
+        # Surface a friendlier message for the known MSA BadRequest error in case
+        # the tenant-ID check above is bypassed somehow.
+        if ($msg -match 'MSA accounts' -or $msg -match 'DirectoryServices') {
+            Write-Host ''
+            Write-Host '  ERROR: The API returned "not supported for MSA accounts".' -ForegroundColor Red
+            Write-Host '  You must sign in with a work/school Entra ID account, not a personal @outlook.com / @hotmail.com account.' -ForegroundColor Red
+            Write-Host '  Retry with: .\Export-EntraUsers.ps1 -TenantId "your-tenant.onmicrosoft.com"' -ForegroundColor Cyan
+            Write-Host ''
+        }
+        Write-Log "Graph connection failed: $msg" 'ERROR'
         throw
     }
 }
@@ -304,6 +355,7 @@ function Connect-ToEntra {
 function Connect-ToAzure {
     Write-Log 'Connecting to Azure Resource Manager (for RBAC) ...'
     try {
+        # $Script:TenantId is always set by Connect-ToEntra before this is called
         $null = Connect-AzAccount -Tenant $Script:TenantId -ErrorAction Stop
         Write-Log 'Azure RM connected.' 'SUCCESS'
     } catch {
@@ -1420,6 +1472,8 @@ function Main {
 
     # Connect
     Connect-ToEntra
+    # After a successful Entra connection the script-level TenantId is populated;
+    # pass it through to Azure RM so both sessions target the same tenant.
     if ($Script:IncludeAzureRBAC) { Connect-ToAzure }
 
     # Resolve user IDs for the selected scope

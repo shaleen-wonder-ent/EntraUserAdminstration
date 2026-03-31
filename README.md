@@ -170,8 +170,7 @@ Pass parameters directly for unattended or scheduled runs.
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `-Scope` | String | *(interactive)* | Export scope: `Tenant`, `SecurityGroup`, `M365Group`, `Department`, `AdministrativeUnit`, `SpecificUsers` |
-| `-ScopeValue` | String | | Name or Object ID of the target group/AU/department. Comma-separated UPNs for `SpecificUsers`. |
-| `-OutputDir` | String | `.\EntraExport_<timestamp>` | Folder where all output files are written |
+| `-ScopeValue` | String | | Name or Object ID of the target group/AU/department. Comma-separated UPNs for `SpecificUsers`. || `-TenantId` | String | | Your Entra ID Tenant ID (GUID) or primary domain (e.g. `contoso.onmicrosoft.com`). **Required if you have a personal @outlook.com / @hotmail.com account on the same browser profile.** Scopes the sign-in prompt to your work/school tenant and prevents the MSA consumer error. Find it at [Entra admin center](https://entra.microsoft.com) → Overview → Tenant ID. || `-OutputDir` | String | `.\EntraExport_<timestamp>` | Folder where all output files are written |
 | `-ExportFormat` | String | `Both` | `JSON`, `CSV`, or `Both` |
 | `-IncludeAzureRBAC` | Switch | `$false` | Collect Azure Resource RBAC assignments across all subscriptions |
 | `-SkipAuthMethods` | Switch | `$false` | Skip MFA / authentication method collection |
@@ -183,6 +182,12 @@ Pass parameters directly for unattended or scheduled runs.
 ```powershell
 # 1. Interactive mode (recommended for first run)
 .\Export-EntraUsers.ps1
+
+# 1a. If you have a personal Microsoft account on the same browser profile,
+#     supply -TenantId to force sign-in against your work tenant and avoid
+#     the "not supported for MSA accounts" error.
+.\Export-EntraUsers.ps1 -TenantId "contoso.onmicrosoft.com"
+.\Export-EntraUsers.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 
 # 2. Entire tenant, all formats + Azure RBAC
 .\Export-EntraUsers.ps1 -Scope Tenant -ExportFormat Both -IncludeAzureRBAC
@@ -338,6 +343,7 @@ One row per Azure resource RBAC assignment (only when `-IncludeAzureRBAC` is use
 
 | Symptom | Cause | Fix |
 |---|---|---|
+| **`This API is not supported for MSA accounts`** | You signed in with a personal Microsoft account (@outlook.com / @hotmail.com) instead of a work/school Entra ID account | Re-run with `-TenantId`: `.\Export-EntraUsers.ps1 -TenantId "contoso.onmicrosoft.com"`. Your Tenant ID is in [Entra admin center](https://entra.microsoft.com) → Overview → Tenant ID |
 | `Install-Module` fails | No internet access or restricted policy | Pre-install modules manually: `Install-Module Microsoft.Graph -Scope CurrentUser` |
 | Sign-in window does not appear | Running in a non-interactive session | Run from an interactive PowerShell session, or use a service principal with a client certificate |
 | `Insufficient privileges` error | Missing Graph permissions | Grant the listed permissions in Entra ID -> App registrations or use a Global Reader account |
