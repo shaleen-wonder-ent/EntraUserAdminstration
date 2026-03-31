@@ -224,7 +224,7 @@ Pass parameters directly for unattended or scheduled runs.
 
 ## Output Screenshot
 
-After a successful run the output folder will look like this in VS Code (all files marked **U** — untracked, kept out of git by `.gitignore`):
+After a successful run the output folder will look like this in VS Code:
 
 ![Export output folder in VS Code](docs/sample_output_structure.png)
 
