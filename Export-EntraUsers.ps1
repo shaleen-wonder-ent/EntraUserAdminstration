@@ -195,6 +195,10 @@ $Script:RequiredGraphModules = @(
     'Microsoft.Graph.Applications'
     'Microsoft.Graph.Identity.SignIns'
 )
+# Microsoft.Graph 2.36.x ships a broken UserProvidedTokenCredential on Windows
+# PowerShell 5.1 / .NET Framework (TypeLoadException: GetTokenAsync not implemented).
+# Cap at 2.34.0 until Microsoft releases a fix.
+$Script:MaxGraphModuleVersion = '2.34.0'
 
 $Script:RequiredAzModules = @(
     'Az.Accounts'
@@ -280,15 +284,22 @@ function Write-Banner {
 function Install-RequiredModules {
     param(
         [Parameter(Mandatory)][string[]] $Modules,
-        [string] $Label = 'modules'
+        [string] $Label = 'modules',
+        [string] $MaxVersion = ''
     )
     Write-Log "Checking $Label ..."
     foreach ($mod in $Modules) {
-        if (-not (Get-Module -ListAvailable -Name $mod -ErrorAction SilentlyContinue)) {
+        # Build optional version-cap parameters for Install-Module / Import-Module.
+        $verParams = @{}
+        if ($MaxVersion) { $verParams['MaximumVersion'] = $MaxVersion }
+
+        $available = Get-Module -ListAvailable -Name $mod -ErrorAction SilentlyContinue |
+                     Where-Object { -not $MaxVersion -or [version]$_.Version -le [version]$MaxVersion }
+        if (-not $available) {
             Write-Log "  Installing $mod from PSGallery ..." 'WARN'
             try {
                 Install-Module -Name $mod -Scope CurrentUser -Force `
-                               -AllowClobber -Repository PSGallery -ErrorAction Stop
+                               -AllowClobber -Repository PSGallery -ErrorAction Stop @verParams
                 Write-Log "  $mod installed." 'SUCCESS'
             } catch {
                 Write-Log "  Failed to install ${mod}: $($_.Exception.Message)" 'ERROR'
@@ -299,11 +310,11 @@ function Install-RequiredModules {
         # warnings from its AutoRest sub-modules during import; these are non-fatal and the
         # module loads correctly. Redirect all streams to suppress the noise.
         if ($mod -like 'Az.*') {
-            $null = Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop *>&1 |
+            $null = Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop @verParams *>&1 |
                     Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] -or
                                    $_.FullyQualifiedErrorId -notmatch 'RegisterAzModule' }
         } else {
-            Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop
+            Import-Module $mod -DisableNameChecking -Force -ErrorAction Stop @verParams
         }
         Write-Log "  $mod loaded." 'DEBUG'
     }
@@ -393,7 +404,14 @@ function Connect-ToAzure {
             $null = Connect-AzAccount -Tenant $Script:TenantId -UseDeviceAuthentication -ErrorAction Stop
             Write-Log 'Azure RM connected (device code).' 'SUCCESS'
         } catch {
-            Write-Log "Azure RM connection failed - Azure RBAC will be skipped. $($_.Exception.Message)" 'WARN'
+            $errMsg = $_.Exception.Message
+            if ($errMsg -match 'Method not found.*Azure\.Identity') {
+                Write-Log "Azure RM connection failed - Azure RBAC will be skipped." 'WARN'
+                Write-Log "  Root cause: Az and Microsoft.Graph modules loaded conflicting Azure.Identity assembly versions." 'WARN'
+                Write-Log "  Permanent fix: run 'Update-Module Az -Force ; Update-Module Microsoft.Graph -Force' in a fresh PowerShell session." 'WARN'
+            } else {
+                Write-Log "Azure RM connection failed - Azure RBAC will be skipped. $errMsg" 'WARN'
+            }
             $Script:IncludeAzureRBAC = $false
         }
     }
@@ -638,20 +656,22 @@ function Get-UserGroupMemberships {
                             SecurityEnabled          = $g.SecurityEnabled
                             MailEnabled              = $g.MailEnabled
                             IsDynamic                = ($g.GroupTypes -contains 'DynamicMembership')
-                            MembershipRule           = $g.MembershipRule
-                            OnPremisesSynced         = $g.OnPremisesSyncEnabled
-                            OnPremisesNetBiosName    = $g.OnPremisesNetBiosName
-                            OnPremisesDomainName     = $g.OnPremisesDomainName
-                            OnPremisesSamAccountName = $g.OnPremisesSamAccountName
-                            OnPremisesDN             = $g.OnPremisesDistinguishedName
+                            MembershipRule           = ($g | Select-Object -ExpandProperty MembershipRule           -ErrorAction SilentlyContinue)
+                            OnPremisesSynced         = ($g | Select-Object -ExpandProperty OnPremisesSyncEnabled    -ErrorAction SilentlyContinue)
+                            OnPremisesNetBiosName    = ($g | Select-Object -ExpandProperty OnPremisesNetBiosName    -ErrorAction SilentlyContinue)
+                            OnPremisesDomainName     = ($g | Select-Object -ExpandProperty OnPremisesDomainName     -ErrorAction SilentlyContinue)
+                            OnPremisesSamAccountName = ($g | Select-Object -ExpandProperty OnPremisesSamAccountName -ErrorAction SilentlyContinue)
+                            OnPremisesDN             = ($g | Select-Object -ExpandProperty OnPremisesDistinguishedName -ErrorAction SilentlyContinue)
                         }
                     } catch {
                         $entry = @{
-                            ObjectType  = 'Group'
-                            Id          = $m.Id
-                            DisplayName = '(access error)'
-                            Category    = 'Unknown'
+                            ObjectType   = 'Group'
+                            Id           = $m.Id
+                            DisplayName  = if ($m.AdditionalProperties['displayName']) { $m.AdditionalProperties['displayName'] } else { '(unknown)' }
+                            Category     = 'Unknown'
+                            AccessError  = $_.Exception.Message -replace '[\r\n]+', ' '
                         }
+                        Write-Log "  [Groups] Cannot read group $($m.Id): $($_.Exception.Message)" 'WARN'
                     }
                 }
 
@@ -1228,6 +1248,7 @@ function Write-CsvExports {
                 OnPremisesDomainName     = $g['OnPremisesDomainName']
                 OnPremisesSamAccountName = $g['OnPremisesSamAccountName']
                 OnPremisesDN             = $g['OnPremisesDN']
+                AccessError              = $g['AccessError']
             }
         }
     }
@@ -1511,7 +1532,8 @@ function Main {
     Write-Log "Output directory: $($Script:OutputDir)"
 
     # Install / load modules
-    Install-RequiredModules -Modules $Script:RequiredGraphModules -Label 'Microsoft Graph modules'
+    Install-RequiredModules -Modules $Script:RequiredGraphModules -Label 'Microsoft Graph modules' `
+                            -MaxVersion $Script:MaxGraphModuleVersion
     if ($Script:IncludeAzureRBAC) {
         Install-RequiredModules -Modules $Script:RequiredAzModules -Label 'Azure PowerShell modules'
     }
